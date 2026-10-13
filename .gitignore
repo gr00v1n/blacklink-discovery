@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+output/
+.auth/
+*.egg-info/
+
+# Local targets, credentials, and collected evidence must not enter a public repo.
+sites.txt
+.env
+.env.*
+evidence/
+*.sqlite
+*.sqlite-*
+*.jsonl
+*.xlsx
+*.csv
