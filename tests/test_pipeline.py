@@ -115,10 +115,10 @@ def test_scan_resume_resources_scope_and_export(tmp_path):
             store.db.execute("SELECT COUNT(*) FROM queue WHERE state='skipped_scope'").fetchone()[0]
             == 1
         )
-        store.export()
-        book = load_workbook(tmp_path / "results.xlsx", read_only=True)
+        target = store.export()
+        book = load_workbook(target / "results.xlsx", read_only=True)
         assert book.sheetnames == ["域名汇总", "发现明细", "扫描覆盖", "引用关系"]
-        assert book["发现明细"].max_row > 5
+        assert sum(1 for _ in book["发现明细"].rows) > 5
         book.close()
     finally:
         store.close()

@@ -5,6 +5,7 @@ import hashlib
 from .extract import normalize
 from .store import Store
 from .supervise import require_run
+from .text import Positions
 
 
 def filters(run: int, site: str | None, domain: str | None, source: str | None):
@@ -59,6 +60,7 @@ def domains(
 ) -> dict:
     require_run(store, run)
     where, values = filters(run, site, domain, source)
+    where += " AND f.host_type!='file_candidate'"
     grouped = (
         "SELECT r.site,f.host AS domain,f.registered,f.host_type,COUNT(*) AS occurrences,"
         "COUNT(DISTINCT r.id) AS resources FROM findings f JOIN resources r ON r.id=f.resource_id "
@@ -131,19 +133,28 @@ def evidence(store: Store, run: int, token: str, context_lines: int, max_chars: 
     except UnicodeDecodeError as error:
         raise ValueError("invalid UTF-8 evidence") from error
     a, b = item["start"], item["end"]
-    if (
-        not 0 <= a < b <= len(text)
-        or item["line"] != text.count("\n", 0, a) + 1
-        or item["column"] != a - text.rfind("\n", 0, a)
-    ):
+    positions = Positions(text)
+    line, column = positions.locate(a)
+    if (item["line"], item["column"]) != (line, column):
+        columns = {r[1] for r in store.db.execute("PRAGMA table_info(resources)")}
+        legacy = (
+            "collector" not in columns
+            or store.db.execute(
+                "SELECT collector FROM resources WHERE id=?", (item["resource_id"],)
+            ).fetchone()[0]
+            == "legacy"
+        )
+        if legacy:
+            positions = Positions(text, legacy=True)
+            line, column = positions.locate(a)
+    if not 0 <= a < b <= len(text) or item["line"] != line or item["column"] != column:
         raise ValueError("invalid finding position; run verify")
-    left = text.rfind("\n", 0, a) + 1
-    right_break = text.find("\n", b)
-    right = len(text) if right_break == -1 else right_break
-    for _ in range(context_lines):
-        left = text.rfind("\n", 0, max(0, left - 1)) + 1
-        right_break = text.find("\n", min(len(text), right + 1))
-        right = len(text) if right_break == -1 else right_break
+    first = max(0, line - 1 - context_lines)
+    last = min(len(positions.lines), positions.locate(b - 1)[0] + context_lines)
+    left = positions.lines[first]
+    right = positions.lines[last] if last < len(positions.lines) else len(text)
+    while right > b and text[right - 1] in "\r\n\u2028\u2029":
+        right -= 1
     full_left, full_right = left, right
     if right - left > max_chars:
         left = max(left, a - max_chars // 4)
@@ -164,7 +175,7 @@ def evidence(store: Store, run: int, token: str, context_lines: int, max_chars: 
         "integrity_ok": True,
         "context_start": left,
         "context_end": right,
-        "context_first_line": text.count("\n", 0, left) + 1,
+        "context_first_line": positions.locate(left)[0],
         "text": text[left:right],
         "truncated": (left, right) != (full_left, full_right),
     }

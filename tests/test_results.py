@@ -122,7 +122,7 @@ def test_evidence_long_lines_stale_ids_and_safe_paths(tmp_path):
     replacement = "// replacement.example.net"
     store.save(run, site, site + "app.js", replacement.encode(), replacement, "js")
     store.close()
-    assert "changed" in cli("evidence", "--run", str(run), "--finding", token, code=2)
+    assert cli("evidence", "--run", str(run), "--finding", token)["host"] == "legacy.example.net"
     token = cli("findings", "--run", str(run))["items"][0]["finding_id"]
     store = Store(str(tmp_path))
     store.db.execute("UPDATE text_views SET path='../outside'")
@@ -130,3 +130,29 @@ def test_evidence_long_lines_stale_ids_and_safe_paths(tmp_path):
     store.close()
     token = cli("findings", "--run", str(run))["items"][0]["finding_id"]
     assert "unsafe" in cli("evidence", "--run", str(run), "--finding", token, code=2)
+
+
+def test_legacy_cr_position_evidence_stays_readable(tmp_path):
+    from blacklink_discovery.results import evidence, findings
+    from blacklink_discovery.supervise import verify
+
+    store = Store(str(tmp_path))
+    text = "// header\r// legacy.example.net"
+    try:
+        run = store.new_run("legacy")
+        resource = store.save(
+            run,
+            "https://site.example/",
+            "https://site.example/app.js",
+            text.encode(),
+            text,
+            "js",
+            collector="legacy",
+        )
+        store.db.execute("UPDATE findings SET line=1,col=14 WHERE resource_id=?", (resource,))
+        store.db.commit()
+        token = findings(store, run, None, None, None, 50, 0)["items"][0]["finding_id"]
+        assert evidence(store, run, token, 5, 4000)["host"] == "legacy.example.net"
+        assert verify(store, run)["integrity_ok"]
+    finally:
+        store.close()

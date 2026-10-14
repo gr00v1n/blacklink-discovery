@@ -2,12 +2,12 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from .collect import import_katana
 from .results import domains, evidence, findings
 from .store import Store
 from .supervise import failures, load_config, resume, retry, save_config, status, verify
+from .urls import canonical_url, normalize_hosts
 
 
 def main():
@@ -27,6 +27,10 @@ def main():
     )
     scan.add_argument("--resume", type=int)
     scan.add_argument("--retry-failed", action="store_true")
+    scan.add_argument(
+        "--browser-fallback", action="store_true", help="静态页面403后单次只读浏览器补采；单独批次"
+    )
+    scan.add_argument("--browser-chrome", help="403补采使用的Chromium路径")
     imported = commands.add_parser("import-katana")
     imported.add_argument("--jsonl", required=True)
     imported.add_argument("--site", required=True)
@@ -36,11 +40,17 @@ def main():
     browser.add_argument("--chrome", help="现有Chromium可执行文件路径")
     browser.add_argument("--wait", type=float, default=3)
     browser.add_argument("--asset-host", action="append", default=[])
+    browser.add_argument("--max-seconds", type=float, default=120)
+    browser.add_argument("--max-responses", type=int, default=500)
+    browser.add_argument("--max-total-bytes", type=int, default=128 * 1024 * 1024)
+    browser.add_argument("--max-bytes", type=int, default=32 * 1024 * 1024)
+    browser.add_argument("--parse-seconds", type=float, default=30)
     for name in ("status", "failures", "verify", "resume", "retry"):
         command = commands.add_parser(name, help="模型监督接口，输出JSON")
         command.add_argument("--run", type=int, required=True)
         if name == "failures":
             command.add_argument("--limit", type=int, default=50)
+            command.add_argument("--offset", type=int, default=0)
         elif name == "resume":
             command.add_argument("--max-urls", type=int, default=0)
         elif name == "retry":
@@ -59,10 +69,14 @@ def main():
     command.add_argument("--finding", required=True)
     command.add_argument("--context-lines", type=int, default=5)
     command.add_argument("--max-chars", type=int, default=4000)
-    commands.add_parser("export")
+    commands.add_parser("export").add_argument("--run", type=int)
     args = parser.parse_args()
     try:
-        store = Store(args.output, read_only=args.command in {"domains", "findings", "evidence"})
+        store = Store(
+            args.output,
+            read_only=args.command
+            in {"domains", "findings", "evidence", "status", "failures", "verify"},
+        )
     except ValueError as error:
         parser.error(str(error))
     try:
@@ -85,16 +99,16 @@ def main():
                 getattr(args, "limit", 1) < 1
                 or getattr(args, "max_attempts", 1) < 1
                 or getattr(args, "max_urls", 0) < 0
+                or getattr(args, "offset", 0) < 0
             ):
                 parser.error("limit/max-attempts must be positive; max-urls must be nonnegative")
             if args.command == "resume":
                 resume(store, args.run, args.max_urls)
-                store.export()
                 report = status(store, args.run)
             elif args.command == "retry":
                 report = retry(store, args.run, args.max_attempts, args.url)
             elif args.command == "failures":
-                report = failures(store, args.run, args.limit)
+                report = failures(store, args.run, args.limit, args.offset)
             elif args.command == "verify":
                 report = verify(store, args.run)
             else:
@@ -105,18 +119,11 @@ def main():
             return
         if args.command == "scan":
             sites = []
-            for line in Path(args.sites).read_text().splitlines():
+            for line in Path(args.sites).read_text(encoding="utf-8-sig").splitlines():
                 line = line.strip()
                 if line and not line.startswith("#"):
                     site = line if "://" in line else "https://" + line
-                    parsed = urlsplit(site)
-                    if (
-                        parsed.scheme not in {"http", "https"}
-                        or not parsed.hostname
-                        or parsed.username
-                    ):
-                        parser.error(f"invalid site: {line}")
-                    sites.append(site)
+                    sites.append(canonical_url(site))
             if not sites:
                 parser.error("site list is empty")
             if args.depth < 0 or args.delay < 0 or args.max_bytes < 1 or args.max_urls < 0:
@@ -128,8 +135,10 @@ def main():
                 "sites": sites,
                 "depth": args.depth,
                 "delay": args.delay,
-                "asset_hosts": args.asset_host,
+                "asset_hosts": sorted(normalize_hosts(args.asset_host)),
                 "max_bytes": args.max_bytes,
+                "browser_fallback": args.browser_fallback,
+                "browser_chrome": args.browser_chrome,
             }
             if not store.db.execute("SELECT 1 FROM run_configs WHERE run_id=?", (run,)).fetchone():
                 save_config(
@@ -139,31 +148,53 @@ def main():
                 )
             else:
                 saved = load_config(store, run)
-                if any(saved[key] != value for key, value in config.items()):
+                if any(
+                    saved.get(key, False if key == "browser_fallback" else None) != value
+                    for key, value in config.items()
+                ):
                     parser.error(
                         "resume configuration differs; use resume --run with saved configuration or create a new scan"
                     )
             if args.retry_failed:
                 retry(store, run, 3, [])
+            print(f"run_id={run}; static collection started", flush=True)
             resume(store, run, args.max_urls)
             print(f"run_id={run}; pending/failed are reported, not treated as complete")
         elif args.command == "browser":
-            from .browser import collect_browser
+            from .browser import BrowserLimits, collect_browser
 
             if args.wait < 0:
                 parser.error("wait must be nonnegative")
             run = asyncio.run(
                 collect_browser(
-                    store, args.url, args.state, args.chrome, args.wait, set(args.asset_host)
+                    store,
+                    args.url,
+                    args.state,
+                    args.chrome,
+                    args.wait,
+                    set(args.asset_host),
+                    BrowserLimits(
+                        args.max_seconds,
+                        args.max_responses,
+                        args.max_total_bytes,
+                        args.max_bytes,
+                        args.parse_seconds,
+                    ),
                 )
             )
             print(f"run_id={run}; check business-page authentication manually")
         elif args.command == "import-katana":
             run = store.new_run("katana-import")
+            print(f"run_id={run}; import started", flush=True)
             import_katana(store, args.jsonl, args.site, run, 6, set())
             print(f"run_id={run}; imported body is Katana decoded text, not wire bytes")
-        store.export()
-        print(f"Results: {store.directory / 'results.xlsx'}")
+        if args.command == "export":
+            target = store.export(args.run)
+            print(
+                f"Results: {target / 'results.xlsx'}; manifest: {store.directory / 'current.json'}"
+            )
+        else:
+            print("Saved to SQLite and evidence files; run export when CSV/Excel is needed.")
     except ValueError as error:
         parser.error(str(error))
     finally:
