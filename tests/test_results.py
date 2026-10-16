@@ -156,3 +156,33 @@ def test_legacy_cr_position_evidence_stays_readable(tmp_path):
         assert verify(store, run)["integrity_ok"]
     finally:
         store.close()
+
+
+def test_domain_summary_excludes_syntax_but_details_keep_it(tmp_path):
+    from openpyxl import load_workbook
+
+    from blacklink_discovery.results import domains, findings
+    from blacklink_discovery.supervise import status
+
+    store = Store(str(tmp_path))
+    try:
+        run = store.new_run("semantic-candidates")
+        text = 'obj.$t("menu.SYe");obj.emit("el.form.change");\n// menu.SYe\nconst h="api.unknown";'
+        store.save(
+            run, "https://test.example/", "https://test.example/app.js", text.encode(), text, "js"
+        )
+        summary = domains(store, run, None, None, None, 50, 0)
+        assert {r["domain"] for r in summary["items"]} == {"menu.sye", "api.unknown"}
+        assert next(r for r in summary["items"] if r["domain"] == "menu.sye")["occurrences"] == 1
+        details = findings(store, run, None, "el.form.change", None, 50, 0)
+        assert details["items"][0]["host_type"] == "syntax_candidate"
+        assert status(store, run)["domains"] == 2
+        book = load_workbook(store.export(run) / "results.xlsx", read_only=True)
+        try:
+            rows = list(book["域名汇总"].values)
+            assert {row[2] for row in rows[1:]} == {"menu.sye", "api.unknown"}
+            assert len(list(book["发现明细"].values)) == 5
+        finally:
+            book.close()
+    finally:
+        store.close()

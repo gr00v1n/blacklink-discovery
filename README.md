@@ -8,6 +8,13 @@ Evidence-first domain discovery for blacklink investigations and asset inventory
 Collect domain mentions from raw HTML, JavaScript, CSS, JSON and browser-rendered content,
 then retain the resource, source location and original evidence for investigation.
 
+PDFs, archives, office documents, images, fonts and media are not content scan targets.
+Their referenced URLs/domains remain in source evidence, but known file URLs are not downloaded.
+Extensionless downloads are stopped at response headers or a recognized binary signature;
+static and browser collectors do not decode or parse those bodies. `skipped_type` / `not_text`
+report these intentional exclusions, not successful document scans. Mislabelled text responses
+are still scanned unless a recognized binary type/signature identifies them.
+
 ## Tooling and acknowledgements
 
 | Tool | Role |
@@ -16,7 +23,8 @@ then retain the resource, source location and original evidence for investigatio
 | [Bishop Fox JSluice](https://github.com/BishopFox/jsluice) | Optional endpoint parsing within Katana, not a replacement for full-text/comment extraction |
 | [Tree-sitter JavaScript](https://github.com/tree-sitter/tree-sitter-javascript) | Syntax-aware comments, string decoding, literal concatenation and source locations |
 | [Playwright](https://playwright.dev/python/) | Browser response and dynamic DOM collection; reuse existing authentication state |
-| HTTPX / SQLite / openpyxl | GET-only static collection, persistent evidence and queues, Excel exports |
+| [curl_cffi](https://github.com/lexiforest/curl_cffi) | GET-only static collection with paired browser headers and TLS/HTTP fingerprints |
+| HTTPX / SQLite / openpyxl | Browser request forwarding, persistent evidence and queues, Excel exports |
 
 **Katana is currently an optional integration, not the engine behind `scan`.**
 Run Katana separately, import its results, and use this project's collector to supplement resources.
@@ -75,6 +83,26 @@ uv run blacklink-discovery --output output export
 
 No total duration or URL-count limit is imposed by default. Page depth defaults to 6;
 the default per-response limit is 32 MiB. Oversized responses are failures, not complete scans.
+Static requests use `curl_cffi` browser impersonation, not a UA-only override. The dependency
+is pinned to 0.16.3 after reproducing native stream cleanup failures in 0.14.0.
+The default ordered profiles are `chrome142 → safari260 → firefox144`, each with its matching default headers.
+For each batch/site/URL, three 403 responses on one profile trigger the next profile. Success stops
+rotation; exhausting the list leaves a failed item (at most nine 403 responses with defaults).
+401, 404, 429, 5xx and transport errors do not trigger this automatic rotation.
+Cookies are isolated between profiles. Requests retain the configured delay and response-size cap.
+Each attempt records its profile, status and received evidence in SQLite, even when repeated bodies
+share content-addressed storage. Counters persist across pauses and resume; explicit retry does not
+reset exhausted profiles. `--max-urls` counts every request, including these 403 attempts.
+Use repeated `--fingerprint VERSION` to set an ordered list, for example:
+
+```bash
+uv run blacklink-discovery --output output scan --sites sites.txt --fingerprint chrome142 --fingerprint firefox144
+```
+
+`--user-agent VALUE` remains an explicit override, but may conflict with a profile's other headers;
+normally omit it. UA override and profile order are saved with the batch and reused by `resume`.
+Older batches without a profile list use the default list; stored UA overrides remain intact.
+This transport does not solve real authentication, missing paths or every access restriction.
 `--max-urls` supports bounded trial runs while retaining pending work.
 No similar-page filtering or blanket query-parameter removal is enabled.
 Even GET requests can have application side effects: use authorized read-only areas.
@@ -105,6 +133,15 @@ Supervision commands return JSON. Inspection does not request target sites; `ret
 while `resume` performs collection. Attempt counts persist across processes and include the first attempt.
 New static runs save configuration, version and lifecycle events. A historical `started` event is not a liveness check.
 Existing runs cannot silently change configuration. Do not run multiple writers against the same output database.
+
+For a supervised command that may restart, use `scan --resume-latest` with the same arguments
+and a dedicated output directory. It creates the first static batch, then reuses the latest
+static batch in that directory; configuration mismatches fail closed. Do not repeatedly run a
+plain `scan` after crashes, since that intentionally creates a new batch. Preserve logs and
+record the actual returned run ID for status/verify; never hard-code run 1 in a service wrapper.
+Repeated crashes/OOM are a blocker, not progress: stop the restart loop and diagnose it.
+Set `PYTHONFAULTHANDLER=1` when launching long-running collectors to retain Python thread stacks
+on native aborts; this is diagnostic, not a fix for native memory corruption.
 
 `verify` checks evidence hashes, UTF-8 views and source positions; integrity failures exit with code 1.
 `integrity_ok` does not prove extraction recall, authentication or whole-site coverage.
@@ -162,11 +199,24 @@ Different business sites may require separate authenticated states.
 Browser HTTP traffic is forwarded through HTTPX with automatic redirects disabled. All HTTP redirects
 (including same-host redirects) and WebSockets are blocked and reported as partial coverage. Use the final
 business-page URL after authentication. This conservative transport is not a transparent browser proxy.
+The static `curl_cffi` profile rotation does not modify Playwright or its browser request forwarding.
 Default single-page safeguards: 120 seconds, 500 responses, 128 MiB total, 32 MiB per response,
 30 seconds per extraction worker. Override with `browser --max-seconds`, `--max-responses`,
 `--max-total-bytes`, `--max-bytes`, `--parse-seconds`; hitting a limit is incomplete, never successful coverage.
 `scan --browser-fallback --browser-chrome PATH` opts into one anonymous supplement per failed HTML 403.
 Its independent run ID is linked in `status`; the original static failure remains visible.
+Use `scan --browser-crawl --browser-chrome PATH` for a combined workflow: successful HTML pages
+and HTML 403 pages receive a browser pass. Successful captured sources and rendered DOM feed
+new authorized links back into the original static queue, repeating until the queue is exhausted
+or the configured depth is reached. Evidence remains linked to the independent browser runs.
+This is link traversal, not automatic scrolling, pagination clicks or authentication.
+`--max-urls` limits static requests per invocation, not browser subrequests; pending work survives resume.
+Shorter paths re-expand stored evidence without repeating completed requests, including material
+from client-side navigation. iframe levels contribute to queue depth. CRLF text and finding positions
+are preserved exactly; DOM status follows the current document, including same-document History API changes.
+Browser runs are linked when created, so interrupted merges can reuse their existing evidence.
+`status` reports `browser_pending` and `workflow_exhausted`; static queue exhaustion alone is not
+workflow completion. Malformed resources remain failures without blocking the remaining queue.
 
 ## Outputs
 
@@ -187,8 +237,12 @@ uv run blacklink-discovery --output output export --run 1
 - `static_received` / `browser_received` resources preserve received bodies before parsing, with no findings; parsed collector records refer to the same content-addressed blobs. Resource counts include both stages and revisions, not unique pages.
 - Line/column values are 1-based. `start`/`end` refer to characters in decoded text, not original byte offsets.
 
-Recognizable file-like candidates remain in findings as `file_candidate`, excluded from domain summaries;
-syntax-aware extraction ignores JS member-access properties. No domain risk classification is applied.
+Recognizable filenames, code keys/versions and prose-like matches remain auditable in findings as
+`file_candidate`, `syntax_candidate` and `prose_candidate`, respectively, but are excluded from domain
+summaries and their occurrence counts. These are extraction heuristics, not risk judgments; review
+the findings when investigating ambiguous bare names. Explicit URL hosts retain hostname semantics.
+Syntax-aware extraction ignores JS member-access properties and parses source-map embedded JS
+with positions mapped back to the original JSON evidence. No domain risk classification is applied.
 PSL is used for grouping, not for rejecting unknown suffixes. Recovered concatenations point to original expressions.
 Source-map embedded sources are linked to their map through derived resource records.
 CSV leading formula characters are escaped for spreadsheet safety; original evidence remains unchanged in SQLite/blobs. XLSX evidence cells are forced to text.

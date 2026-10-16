@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS resources(id INTEGER PRIMARY KEY, run_id INTEGER, sit
  kind TEXT, status INTEGER, evidence_path TEXT, error TEXT);
 CREATE TABLE IF NOT EXISTS text_views(resource_id INTEGER PRIMARY KEY,path TEXT);
 CREATE TABLE IF NOT EXISTS edges(run_id INTEGER,site TEXT,parent TEXT,child TEXT,relation TEXT,
- parent_resource_id INTEGER DEFAULT 0, UNIQUE(run_id,site,parent,child,relation,parent_resource_id));
+ parent_resource_id INTEGER DEFAULT 0, start INTEGER, end INTEGER,
+ UNIQUE(run_id,site,parent,child,relation,parent_resource_id,start,end));
 CREATE TABLE IF NOT EXISTS findings(resource_id INTEGER,host TEXT,registered TEXT,host_type TEXT,
  start INTEGER,end INTEGER,line INTEGER,col INTEGER,source TEXT,method TEXT,evidence TEXT,
  UNIQUE(resource_id,host,start,end,source));
@@ -36,6 +37,12 @@ CREATE TABLE IF NOT EXISTS request_observations(id INTEGER PRIMARY KEY,run_id IN
  resource_id INTEGER);
 CREATE TABLE IF NOT EXISTS browser_fallbacks(run_id INTEGER,site TEXT,url TEXT,browser_run_id INTEGER,
  state TEXT,UNIQUE(run_id,site,url));
+CREATE TABLE IF NOT EXISTS expansions(resource_id INTEGER PRIMARY KEY,depth INTEGER);
+CREATE TABLE IF NOT EXISTS browser_depths(run_id INTEGER,url TEXT,depth INTEGER,
+ UNIQUE(run_id,url));
+CREATE TABLE IF NOT EXISTS static_requests(id INTEGER PRIMARY KEY,run_id INTEGER,site TEXT,url TEXT,
+ fingerprint TEXT,status INTEGER,resource_id INTEGER,error TEXT,time TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS static_fingerprint_attempts ON static_requests(run_id,site,url,fingerprint,status);
 """
 
 EXCEL_ROWS = 1048576
@@ -110,13 +117,19 @@ class Store:
         definition = self.db.execute("SELECT sql FROM sqlite_master WHERE name='edges'").fetchone()[
             0
         ]
-        if "relation,parent_resource_id" not in definition.replace(" ", "").replace("\n", ""):
+        # Each source offset is a separate occurrence. Rebuilding adds the columns
+        # without collapsing legacy rows that had no recorded position.
+        if "start" not in definition.replace(" ", "").replace("\n", ""):
             self.db.execute("ALTER TABLE edges RENAME TO edges_legacy")
             self.db.execute(
-                "CREATE TABLE edges(run_id INTEGER,site TEXT,parent TEXT,child TEXT,relation TEXT,parent_resource_id INTEGER DEFAULT 0,UNIQUE(run_id,site,parent,child,relation,parent_resource_id))"
+                "CREATE TABLE edges(run_id INTEGER,site TEXT,parent TEXT,child TEXT,relation TEXT,parent_resource_id INTEGER DEFAULT 0,start INTEGER,end INTEGER,UNIQUE(run_id,site,parent,child,relation,parent_resource_id,start,end))"
             )
+            legacy = {r[1] for r in self.db.execute("PRAGMA table_info(edges_legacy)")}
+            start = "start" if "start" in legacy else "NULL"
+            end = "end" if "end" in legacy else "NULL"
             self.db.execute(
-                "INSERT INTO edges SELECT run_id,site,parent,child,relation,COALESCE(parent_resource_id,0) FROM edges_legacy"
+                "INSERT INTO edges SELECT run_id,site,parent,child,relation,COALESCE(parent_resource_id,0),"
+                f"{start},{end} FROM edges_legacy"
             )
             self.db.execute("DROP TABLE edges_legacy")
         self.db.execute(
@@ -133,11 +146,19 @@ class Store:
         return cursor.lastrowid
 
     def edge(
-        self, run: int, site: str, parent: str, child: str, relation: str, parent_resource_id=0
+        self,
+        run: int,
+        site: str,
+        parent: str,
+        child: str,
+        relation: str,
+        parent_resource_id=0,
+        start=None,
+        end=None,
     ):
         self.db.execute(
-            "INSERT OR IGNORE INTO edges(run_id,site,parent,child,relation,parent_resource_id) VALUES(?,?,?,?,?,?)",
-            (run, site, parent, child, relation, parent_resource_id),
+            "INSERT OR IGNORE INTO edges(run_id,site,parent,child,relation,parent_resource_id,start,end) VALUES(?,?,?,?,?,?,?,?)",
+            (run, site, parent, child, relation, parent_resource_id, start, end),
         )
         self.db.commit()
 
@@ -246,7 +267,7 @@ class Store:
         staging = root / (".tmp-" + generation)
         staging.mkdir()
         queries = {
-            "域名汇总": "SELECT r.run_id,r.site,f.host,f.registered,f.host_type,COUNT(*) AS occurrences FROM findings f JOIN resources r ON r.id=f.resource_id WHERE f.host_type!='file_candidate' GROUP BY r.run_id,r.site,f.host,f.host_type",
+            "域名汇总": "SELECT r.run_id,r.site,f.host,f.registered,f.host_type,COUNT(*) AS occurrences FROM findings f JOIN resources r ON r.id=f.resource_id WHERE f.host_type IN ('dns','ip','single_label') GROUP BY r.run_id,r.site,f.host,f.host_type",
             "发现明细": "SELECT r.run_id,r.id AS resource_id,r.collector,r.status,r.encoding,r.error,r.site,r.url,f.host,f.host_type,f.line,f.col,f.source,f.method,f.evidence,r.evidence_path,t.path AS decoded_text_path,f.start,f.end FROM findings f JOIN resources r ON r.id=f.resource_id LEFT JOIN text_views t ON t.resource_id=r.id ORDER BY r.run_id,r.site,r.url,f.start",
             "扫描覆盖": "SELECT q.run_id,q.site,q.state,COUNT(*) AS urls,GROUP_CONCAT(DISTINCT q.error) AS errors FROM queue q GROUP BY q.run_id,q.site,q.state",
             "引用关系": "SELECT * FROM edges ORDER BY run_id,site,parent,child",

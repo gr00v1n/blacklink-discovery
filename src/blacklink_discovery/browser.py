@@ -1,6 +1,7 @@
 """Bounded single-page browser supplement with fail-closed network interception."""
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import sys
@@ -13,7 +14,7 @@ from .collect import clean_url, kind_for, progress
 from .extract import Mention
 from .store import Store
 from .text import decode_body
-from .urls import authorized, canonical_url, normalize_hosts
+from .urls import authorized, canonical_url, non_text_response, non_text_url, normalize_hosts
 
 
 @asynccontextmanager
@@ -68,6 +69,9 @@ async def collect_browser(
     wait: float,
     asset_hosts: set[str],
     limits: BrowserLimits | None = None,
+    *,
+    parent_run: int | None = None,
+    parent_site: str | None = None,
 ):
     from playwright.async_api import Error as PlaywrightError
     from playwright.async_api import async_playwright
@@ -86,6 +90,15 @@ async def collect_browser(
     ):
         raise ValueError("browser limits must be positive")
     run = store.new_run("authenticated-browser" if state else "anonymous-browser")
+    # Linked page batches share response bodies in the parent run. The page batch
+    # only keeps its own request observations and rendered DOM.
+    evidence_run = parent_run if parent_run is not None else run
+    if parent_run is not None:
+        store.db.execute(
+            "UPDATE browser_fallbacks SET browser_run_id=? WHERE run_id=? AND site=? AND url=?",
+            (run, parent_run, parent_site, url),
+        )
+        store.db.commit()
     print(f"run_id={run}; browser supplement started", flush=True)
     progress(store, run, "browser_started")
     pending = asyncio.Queue(maxsize=8)
@@ -130,13 +143,35 @@ async def collect_browser(
     async def persist(identity, request_url, body, mime, status):
         text, encoding, warning = decode_body(body, mime)
         kind = kind_for(request_url, mime)
+        existing = store.db.execute(
+            "SELECT id FROM resources WHERE run_id=? AND url=? AND collector='browser_response' AND status=? AND evidence_path=?",
+            (
+                evidence_run,
+                request_url,
+                status,
+                f"evidence/{hashlib.sha256(body).hexdigest()}",
+            ),
+        ).fetchone()
+        if existing:
+            store.edge(
+                evidence_run,
+                parent_site or url,
+                url,
+                request_url,
+                "browser_response",
+                parent_resource_id=existing[0],
+            )
+            finish(identity, request_url, "captured", status, warning, existing[0])
+            return
         progress(store, run, "browser_parse", request_url)
         parsed = await parse_response(text, kind, request_url, limits.parse_seconds)
         if finalized:
             return
+        # Keep the scan entry as site. Response URL is the resource URL, so one
+        # script stays one finding set while each page keeps its own edge.
         resource = store.save(
-            run,
-            url,
+            evidence_run,
+            parent_site or url,
             request_url,
             body,
             text,
@@ -147,14 +182,31 @@ async def collect_browser(
             encoding=encoding,
             mentions=[Mention(**m) for m in parsed["mentions"]],
         )
-        store.edge(run, url, url, request_url, "browser_response", parent_resource_id=resource)
-        for child, _, relation in parsed["references"]:
-            store.edge(run, url, request_url, child, relation, parent_resource_id=resource)
+        store.edge(
+            evidence_run,
+            parent_site or url,
+            url,
+            request_url,
+            "browser_response",
+            parent_resource_id=resource,
+        )
+        for child, _, relation, *position in parsed["references"]:
+            start, end = (position + [None, None])[:2]
+            store.edge(
+                evidence_run,
+                parent_site or url,
+                request_url,
+                child,
+                relation,
+                parent_resource_id=resource,
+                start=start,
+                end=end,
+            )
         for source in parsed["sources"]:
             derived = request_url + f"#sourcesContent/{source['index']}"
             store.save(
-                run,
-                url,
+                evidence_run,
+                parent_site or url,
                 derived,
                 source["text"].encode(),
                 source["text"],
@@ -166,7 +218,12 @@ async def collect_browser(
                 mentions=[Mention(**m) for m in source["mentions"]],
             )
             store.edge(
-                run, url, request_url, derived, "source_map_content", parent_resource_id=resource
+                evidence_run,
+                parent_site or url,
+                request_url,
+                derived,
+                "source_map_content",
+                parent_resource_id=resource,
             )
             if source["error"]:
                 warning = source["error"]
@@ -199,6 +256,24 @@ async def collect_browser(
         request = route.request
         identity = observation(request.url, request.method, request.resource_type)
         try:
+            relative_depth = 0
+            try:
+                frame = request.frame
+                if request.is_navigation_request() and frame == page.main_frame:
+                    current_document["status"] = 0
+                    current_document["generation"] += 1
+                while frame.parent_frame is not None:
+                    relative_depth += 1
+                    frame = frame.parent_frame
+            except PlaywrightError:
+                # Worker requests have no frame; URL evidence must still survive.
+                pass
+            store.db.execute(
+                "INSERT INTO browser_depths(run_id,url,depth) VALUES(?,?,?) "
+                "ON CONFLICT(run_id,url) DO UPDATE SET depth=MIN(depth,excluded.depth)",
+                (run, canonical_url(request.url), relative_depth),
+            )
+            store.db.commit()
             # URL mentions survive even for blocked requests; duplicates share one evidence resource.
             resource = store.save(
                 run,
@@ -226,6 +301,10 @@ async def collect_browser(
                 )
                 await route.abort()
                 return
+            if non_text_url(request_url):
+                finish(identity, request_url, "not_text")
+                await route.abort()
+                return
             if response_count >= limits.responses:
                 finish(
                     identity, request.url, "blocked", error="browser response count limit reached"
@@ -247,15 +326,23 @@ async def collect_browser(
                 async with forwarded_response(
                     client, request.method, request_url, headers
                 ) as response:
+                    mime = response.headers.get("content-type", "")
+                    if non_text_response(request_url, mime):
+                        finish(identity, request_url, "not_text", response.status_code)
+                        await route.abort()
+                        return
                     parts, size = [], 0
                     async for chunk in response.aiter_bytes(chunk_size=65536):
+                        if not parts and non_text_response(request_url, mime, chunk[:16]):
+                            finish(identity, request_url, "not_text", response.status_code)
+                            await route.abort()
+                            return
                         size += len(chunk)
                         total_bytes += len(chunk)
                         if size > limits.response_bytes or total_bytes > limits.bytes:
                             raise ValueError("browser byte limit reached")
                         parts.append(chunk)
                     body = b"".join(parts)
-                    mime = response.headers.get("content-type", "")
                     textual = (
                         not mime
                         or response.status_code >= 400
@@ -268,8 +355,8 @@ async def collect_browser(
                     if textual:
                         text, encoding, warning = decode_body(body, mime)
                         received = store.save(
-                            run,
-                            url,
+                            evidence_run,
+                            parent_site or url,
                             request_url,
                             body,
                             text,
@@ -378,37 +465,54 @@ async def collect_browser(
                 await context.route("**/*", lambda route: route_request(route, client))
                 await context.route_web_socket("**/*", block_websocket)
                 page = await context.new_page()
+                current_document = {"status": 0, "generation": 0}
+
+                def document_response(response):
+                    if (
+                        response.request.is_navigation_request()
+                        and response.frame == page.main_frame
+                    ):
+                        current_document["status"] = response.status
+
+                page.on("response", document_response)
                 response = await page.goto(
                     url, wait_until="domcontentloaded", timeout=min(30000, limits.seconds * 1000)
                 )
                 if response is None or response.status >= 400:
                     errors.append("main document failed; DOM is not successful coverage")
                 await page.wait_for_timeout(wait * 1000)
+                dom_url = page.url
+                generation = current_document["generation"]
                 dom = await page.content()
+                dom_status = (
+                    current_document["status"]
+                    if page.url == dom_url and current_document["generation"] == generation
+                    else 0
+                )
                 store.save(
                     run,
                     url,
-                    page.url + "#dom",
+                    url + "#dom",
                     dom.encode(),
                     dom,
                     "html",
+                    status=dom_status,
                     collector="browser_dom_received",
                     mentions=[],
                 )
-                parsed = await parse_response(dom, "html", page.url, limits.parse_seconds)
+                parsed = await parse_response(dom, "html", dom_url, limits.parse_seconds)
                 resource = store.save(
                     run,
                     url,
-                    page.url + "#dom",
+                    url + "#dom",
                     dom.encode(),
                     dom,
                     "html",
+                    status=dom_status,
                     collector="browser_dom",
                     mentions=[Mention(**m) for m in parsed["mentions"]],
                 )
-                store.edge(
-                    run, url, url, page.url + "#dom", "rendered_dom", parent_resource_id=resource
-                )
+                store.edge(run, url, url, url + "#dom", "rendered_dom", parent_resource_id=resource)
             finally:
                 receiving = False
             if context:
@@ -455,15 +559,20 @@ async def collect_browser(
             collector_task.cancel()
 
         async def cleanup():
-            operations = [*tuple(active), collector_task, exits.aclose()]
-            if context:
-                operations.append(context.close())
-            if browser:
-                operations.append(browser.close())
-            results = await asyncio.gather(*operations, return_exceptions=True)
+            results = await asyncio.gather(*tuple(active), collector_task, return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
                     errors.append(f"browser cleanup failed: {type(result).__name__}")
+            # Playwright's transport must outlive context/browser close operations.
+            try:
+                if context:
+                    await context.close()
+            finally:
+                try:
+                    if browser:
+                        await browser.close()
+                finally:
+                    await exits.aclose()
 
         cleanup_task = asyncio.create_task(cleanup())
         done, _ = await asyncio.wait({cleanup_task}, timeout=3)

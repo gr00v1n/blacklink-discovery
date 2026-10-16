@@ -4,6 +4,11 @@
 
 **出现即记录，不判断是否调用，不判断是否黑链。** 独立 Python CLI 项目。
 
+PDF、压缩包、Office 文档、图片、字体和音视频不是正文扫描对象。
+引用处出现的 URL/域名照常保存，但已知文件 URL 不下载；无扩展名下载根据响应类型或已识别的
+二进制文件签名提前停止，不进入静态/动态文本解析。`skipped_type` / `not_text` 表示主动排除，
+不是已完成文档扫描。无法识别为二进制的错标文本响应仍会扫描。
+
 ## 技术方案与致谢
 
 本项目采用现有采集和解析工具组合，不把域名发现与黑链风险判断混在一起：
@@ -14,7 +19,8 @@
 | [Bishop Fox JSluice](https://github.com/BishopFox/jsluice) | Katana 的可选 JS 端点解析能力；不是全文注释扫描的替代品 |
 | [Tree-sitter JavaScript](https://github.com/tree-sitter/tree-sitter-javascript) | JS 语法解析、注释定位、字符串解码和简单拼接恢复 |
 | [Playwright](https://playwright.dev/python/) | 动态 DOM 与浏览器响应补采，复用已有认证状态 |
-| HTTPX / SQLite / openpyxl | GET-only 静态采集、持久证据与队列、Excel 导出 |
+| [curl_cffi](https://github.com/lexiforest/curl_cffi) | GET-only 静态采集，浏览器配套请求头与 TLS/HTTP 指纹 |
+| HTTPX / SQLite / openpyxl | 浏览器请求转发、持久证据与队列、Excel 导出 |
 
 **当前 Katana 是可选集成，并非本程序 scan 命令的执行引擎。** scan 使用 GET-only 采集；
 Katana 由操作者单独执行，本程序导入其结果并补取资源。自动调度 Katana 尚未实现。
@@ -66,6 +72,20 @@ uv run blacklink-discovery --output output export
 ```
 
 默认不设总时间或 URL 数上限。深度默认 6，32 MiB 单响应保护上限，超出记失败不冒充完成。
+静态采集改用 curl_cffi 浏览器指纹，不再仅替换 UA。默认顺序：`chrome142 → safari260 → firefox144`，使用配套默认请求头。
+依赖固定为 0.16.3；0.14.0 已在独立实验中复现原生流式清理崩溃，不应降回旧版。
+每批次/站点/URL，一个指纹累计三次 403 后切换下一个；成功即停止，全部耗尽记失败，默认最多九次 403。
+401、404、429、5xx 和网络异常不触发自动轮换。不同指纹 Cookie 隔离，每次请求仍遵守 delay 与响应大小限制。
+SQLite 记录每次尝试的指纹、状态及已收到正文证据，相同正文可共享文件；暂停续跑保留计数，retry 不重置耗尽指纹。
+`--max-urls` 包含全部 403 尝试。可重复指定 `--fingerprint VERSION` 定义顺序，例如：
+
+```bash
+uv run blacklink-discovery --output output scan --sites sites.txt --fingerprint chrome142 --fingerprint firefox144
+```
+
+`--user-agent VALUE` 仍可显式覆盖，但可能与指纹其他请求头不一致，一般不设置。
+指纹顺序及 UA 覆盖值随批次保存；旧批次未保存指纹列表时使用默认列表，已保存 UA 保留。
+不能保证解决所有 403，也不自动登录或放开其他访问限制。
 `--max-urls` 可控制试扫数量，剩余队列保留 pending。全量扫描需检查覆盖表并补扫。
 不启用相似页面过滤，不忽略查询参数。GET 仍可能有业务副作用，请使用只读范围。
 
@@ -90,6 +110,12 @@ uv run blacklink-discovery --output output verify --run 1
 verify 检查证据哈希、解码文本和行列位置，失败退出码1；范围、深度、请求失败仍单独列出。
 integrity_ok 不保证全站完整或登录有效，coverage_clear 仅表示已枚举队列无遗漏状态。
 不要并发写同一输出库。失败明细可能含 URL 查询参数等敏感数据，应本地查看并脱敏后分享。
+
+可能自动重启的服务使用 `scan --resume-latest`，配合同一套参数及专用输出目录：首次创建静态批次，
+后续复用该目录最新静态批次，配置变化则拒绝。崩溃后不要反复执行普通 scan 创建新批次。
+保留日志，status/verify 使用实际返回的 run_id，不在包装脚本写死 run 1。
+反复崩溃/OOM 属于阻塞，不是正常进度，应停止重启循环并定位。
+长任务可设置 `PYTHONFAULTHANDLER=1`，原生 abort 时保留 Python 线程栈；这是诊断手段，不代表修复原生内存损坏。
 
 ## 模型查看实时结果
 
@@ -139,11 +165,22 @@ uv run blacklink-discovery --output output browser --url https://business.compan
 
 浏览器 HTTP 请求由 HTTPX 转发，禁用自动重定向；所有 HTTP 重定向（包括同主机）和 WebSocket
 均阻断并标记部分覆盖。请使用认证后的最终业务 URL；此传输不是透明浏览器代理。
+静态 curl_cffi 指纹轮换不修改 Playwright 及其浏览器请求转发。
 单页默认保护上限：120秒、500响应、总128 MiB、单响应32 MiB、单次解析30秒。
 可通过 browser 的 --max-seconds/--max-responses/--max-total-bytes/--max-bytes/--parse-seconds 调整；
 触及上限明确记未完成，不冒充全站完成。
 `scan --browser-fallback --browser-chrome PATH` 显式启用：失败的 HTML 403 单次匿名补采，
 独立批次在 status 中关联，原静态失败不被掩盖。
+`scan --browser-crawl --browser-chrome PATH` 启用组合工作流：成功 HTML 和 HTML 403 页面
+均执行浏览器补采，成功源码与动态 DOM 中的新授权链接回流原静态队列，自动反复接续，
+直到队列结束或达到配置深度。证据保留与独立浏览器批次的关联。
+这是链接遍历，不包含自动滚动、点击分页或登录。
+`--max-urls` 限制本次执行的静态请求数，不限制浏览器子请求；pending 可继续 resume。
+发现更短路径时重放已存证据，不重复已完成请求；客户端导航后的材料也会接续，iframe 层级计入队列深度。
+CRLF 文本与证据坐标保持一致；DOM 状态对应当前文档，支持 History API 同文档 URL 变化。
+浏览器批次创建时立即关联父批次，中断合并可复用已有证据。
+status 的 `browser_pending` 与 `workflow_exhausted` 用于判断工作流；静态队列为空不等于动态完成。
+错误格式资源保留失败，但不阻断其他队列任务。
 
 ## 输出
 
@@ -164,7 +201,11 @@ uv run blacklink-discovery --output output export --run 1
 - static_received/browser_received 保存解析前已收到的正文，不含发现；解析后记录共享证据文件。资源数包含这两个阶段及版本，不等于唯一页面数。
 - 行列从 1 开始，start/end 是已解码文本的字符区间，不是原始字节偏移。
 
-可识别的文件名候选仍在发现明细标记 file_candidate，不进入域名汇总；JS 属性访问用语法排除。
+可识别的文件名、代码键名/版本号、正文误匹配分别在发现明细标记为
+`file_candidate`、`syntax_candidate`、`prose_candidate`，保留证据，但不计入域名汇总及出现次数。
+这些是提取启发式，不是风险判定；调查有歧义的裸名称时仍应查看发现明细。
+显式 URL 中的主机名不受上述清噪影响。JS 属性访问用语法排除；source map 内嵌 JS
+按代码解析，位置映射回原始 JSON 证据。
 不做域名风险判定；PSL 只分组，不过滤未知后缀。
 拼接结果指向原表达式；source map 源码通过派生 URL 和引用边关联回 map。
 CSV 对公式开头字符转义以保护电子表格；SQLite/证据文件保留未改动原文。XLSX 强制证据为文本。

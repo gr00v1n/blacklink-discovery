@@ -7,12 +7,18 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
-import httpx
+from curl_cffi.requests.exceptions import RequestException
 
 from .markup import Markup
+from .static_http import (
+    DEFAULT_FINGERPRINTS,
+    FORBIDDEN_ATTEMPTS,
+    FingerprintClient,
+    validate_fingerprints,
+)
 from .store import Store
 from .text import decode_body
-from .urls import authorized, canonical_url
+from .urls import authorized, canonical_url, non_text_response, non_text_url
 
 ASSET = re.compile(r"\.(?:m?js|css|json|map)(?:$|\?)", re.IGNORECASE)
 
@@ -24,7 +30,9 @@ def clean_url(base: str, value: str) -> str | None:
         return None
 
 
-def kind_for(url: str, mime: str) -> str:
+def kind_for(url: str, mime: str, prefix: bytes = b"") -> str:
+    if non_text_response(url, mime, prefix):
+        return "binary"
     path, mime = urlsplit(url).path.lower(), mime.lower()
     if "javascript" in mime or path.endswith((".js", ".mjs", ".cjs")):
         return "js"
@@ -49,7 +57,7 @@ def references(text: str, url: str, kind: str):
                 if candidate:
                     base = candidate
                     break
-        for tag, attrs, _, _ in markup.tags:
+        for tag, attrs, start, end in markup.tags:
             rel = set((attrs.get("rel") or "").lower().split())
             for key in ("href", "src"):
                 if tag not in {"a", "iframe", "script", "link"} or not attrs.get(key):
@@ -62,10 +70,11 @@ def references(text: str, url: str, kind: str):
                         or ("preload" in rel and attrs.get("as") in {"script", "style", "fetch"})
                         or bool(ASSET.search(child))
                     )
-                    yield child, asset, f"{tag}.{key}"
+                    yield child, asset, f"{tag}.{key}", start, end
         for script_kind, a, b in markup.scripts:
             if script_kind == "js":
-                yield from references(text[a:b], base, "js")
+                for child, asset, relation, start, end in references(text[a:b], base, "js"):
+                    yield child, asset, relation, a + start, a + end
     if kind in {"js", "css"}:
         patterns = [
             r"sourceMappingURL\s*=\s*([^\s*]+)",
@@ -75,9 +84,13 @@ def references(text: str, url: str, kind: str):
         ]
         for pattern in patterns:
             for match in re.finditer(pattern, text):
-                child = clean_url(url, match[1])
+                value = match[1]
+                # Dependency tokens must be paths/URLs, not prose or build commands.
+                if re.search(r"[\s<>`{}|]", value):
+                    continue
+                child = clean_url(url, value)
                 if child:
-                    yield child, True, "resource_dependency"
+                    yield child, True, "resource_dependency", match.start(1), match.end(1)
     if kind == "xml":
         try:
             root = ET.fromstring(text)
@@ -88,12 +101,12 @@ def references(text: str, url: str, kind: str):
                 child = clean_url(url, node.text)
                 if child:
                     nested = root.tag.split("}")[-1] == "sitemapindex"
-                    yield child, nested, "sitemap_index" if nested else "sitemap"
+                    yield child, nested, "sitemap_index" if nested else "sitemap", None, None
     if urlsplit(url).path.lower().endswith("robots.txt"):
         for match in re.finditer(r"^Sitemap:\s*(\S+)", text, re.IGNORECASE | re.MULTILINE):
             child = clean_url(url, match[1])
             if child:
-                yield child, True, "robots_sitemap"
+                yield child, True, "robots_sitemap", match.start(1), match.end(1)
 
 
 def enqueue(
@@ -128,6 +141,15 @@ def enqueue(
     store.db.commit()
 
 
+def record_expansion(store: Store, resource_id: int, depth: int):
+    store.db.execute(
+        "INSERT INTO expansions(resource_id,depth) VALUES(?,?) "
+        "ON CONFLICT(resource_id) DO UPDATE SET depth=MIN(depth,excluded.depth)",
+        (resource_id, depth),
+    )
+    store.db.commit()
+
+
 def process(
     store,
     run,
@@ -147,7 +169,12 @@ def process(
     error="",
     mentions=None,
     queue_references=True,
+    parent_resource_id=0,
 ):
+    if non_text_response(url, "", body[:16]) or kind == "binary":
+        if queue_references:
+            enqueue(store, run, site, url, depth, False, "skipped_type")
+        return None
     resource_id = store.save(
         run,
         site,
@@ -160,14 +187,32 @@ def process(
         collector=collector,
         encoding=encoding,
         mentions=mentions,
+        parent_resource_id=parent_resource_id,
     )
     if expand:
-        for child, asset, relation in references(text, url, kind):
+        try:
+            children = list(references(text, url, kind))
+        except ValueError:
+            if queue_references:
+                record_expansion(store, resource_id, depth)
+            raise
+        for child, asset, relation, start, end in children:
             permitted = authorized(child, site, asset, external_assets)
-            store.edge(run, site, url, child, relation, parent_resource_id=resource_id)
+            store.edge(
+                run,
+                site,
+                url,
+                child,
+                relation,
+                parent_resource_id=resource_id,
+                start=start,
+                end=end,
+            )
             state = "pending" if permitted else "skipped_scope"
+            if non_text_url(child):
+                state = "skipped_type"
             if permitted and not asset and depth >= max_depth:
-                state = "skipped_depth"
+                state = "skipped_depth" if state == "pending" else state
             if queue_references:
                 enqueue(
                     store,
@@ -180,6 +225,8 @@ def process(
                     asset,
                     state,
                 )
+        if queue_references:
+            record_expansion(store, resource_id, depth)
     if kind == "json":
         try:
             mapping = json.loads(text)
@@ -232,6 +279,16 @@ def process(
     return resource_id
 
 
+def next_fingerprint(store: Store, run: int, site: str, url: str, fingerprints: list[str]):
+    forbidden = dict(
+        store.db.execute(
+            "SELECT fingerprint,COUNT(*) FROM static_requests WHERE run_id=? AND site=? AND url=? AND status=403 GROUP BY fingerprint",
+            (run, site, url),
+        )
+    )
+    return next((p for p in fingerprints if forbidden.get(p, 0) < FORBIDDEN_ATTEMPTS), None)
+
+
 def crawl(
     store: Store,
     run: int,
@@ -241,7 +298,10 @@ def crawl(
     external_assets: set[str],
     max_bytes: int,
     max_urls: int = 0,
+    user_agent: str | None = None,
+    fingerprints=DEFAULT_FINGERPRINTS,
 ):
+    fingerprints = validate_fingerprints(fingerprints)
     authorized_sites = {canonical_url(site) for site in sites}
     # Only configured sites seed work. Existing rows cannot authorize their own site.
     for site in sorted(authorized_sites):
@@ -251,7 +311,7 @@ def crawl(
     store.db.execute(
         "CREATE INDEX IF NOT EXISTS queue_pending_schedule ON queue(run_id,state,depth)"
     )
-    with httpx.Client(timeout=20, follow_redirects=False) as client:
+    with FingerprintClient(user_agent=user_agent) as client:
         count = 0
         while not max_urls or count < max_urls:
             row = store.db.execute(
@@ -261,6 +321,7 @@ def crawl(
             if row is None:
                 break
             url, row_site = row["url"], row["site"]
+            request_id = None
             try:
                 site = canonical_url(row_site)
                 if site not in authorized_sites:
@@ -273,14 +334,34 @@ def crawl(
                 url = canonical_url(url)
                 if not authorized(url, site, bool(row["asset"]), external_assets):
                     raise ValueError("outside authorized target/asset hosts")
+                if non_text_url(url):
+                    store.db.execute(
+                        "UPDATE queue SET state='skipped_type',error='non-target resource' WHERE run_id=? AND site=? AND url=?",
+                        (run, row_site, row["url"]),
+                    )
+                    store.db.commit()
+                    continue
+                fingerprint = next_fingerprint(store, run, site, url, fingerprints)
+                if fingerprint is None:
+                    raise ValueError("HTTP 403: fingerprint attempts exhausted")
                 count += 1
                 time.sleep(delay)
                 store.db.execute(
                     "INSERT INTO attempts(run_id,site,url,count) VALUES(?,?,?,1) ON CONFLICT(run_id,site,url) DO UPDATE SET count=count+1",
                     (run, site, url),
                 )
+                request_id = store.db.execute(
+                    "INSERT INTO static_requests(run_id,site,url,fingerprint) VALUES(?,?,?,?)",
+                    (run, site, url, fingerprint),
+                ).lastrowid
                 store.db.commit()
-                with client.stream("GET", url) as response:
+                with client.stream("GET", url, fingerprint=fingerprint) as response:
+                    store.db.execute(
+                        "UPDATE static_requests SET status=? WHERE id=?",
+                        (response.status_code, request_id),
+                    )
+                    store.db.commit()
+                    is_redirect = response.status_code in {301, 302, 303, 307, 308}
                     location = response.headers.get("location")
                     if location:
                         target = clean_url(url, location)
@@ -296,18 +377,37 @@ def crawl(
                                 collector="static_header",
                             )
                             store.edge(run, site, url, target, "redirect")
-                            if response.is_redirect and authorized(
+                            if is_redirect and authorized(
                                 target, site, bool(row["asset"]), external_assets
                             ):
                                 enqueue(store, run, site, target, row["depth"], bool(row["asset"]))
-                    chunks, size = [], 0
-                    for chunk in response.iter_bytes():
+                    mime = response.headers.get("content-type", "")
+                    if non_text_response(url, mime):
+                        store.db.execute(
+                            "UPDATE queue SET state='skipped_type',error='non-target response type' WHERE run_id=? AND site=? AND url=?",
+                            (run, row_site, row["url"]),
+                        )
+                        store.db.commit()
+                        continue
+                    chunks, size, binary = [], 0, False
+                    prefix = b""
+                    for chunk in response.iter_content():
+                        prefix = (prefix + chunk[:16])[:16]
+                        if non_text_response(url, mime, prefix):
+                            binary = True
+                            break
                         size += len(chunk)
                         if size > max_bytes:
                             raise ValueError(f"response exceeds {max_bytes} bytes")
                         chunks.append(chunk)
+                    if binary:
+                        store.db.execute(
+                            "UPDATE queue SET state='skipped_type',error='binary response signature' WHERE run_id=? AND site=? AND url=?",
+                            (run, row_site, row["url"]),
+                        )
+                        store.db.commit()
+                        continue
                     body = b"".join(chunks)
-                    mime = response.headers.get("content-type", "")
                     decoded_body = body
                     if body.startswith(b"\x1f\x8b") and urlsplit(url).path.lower().endswith(".gz"):
                         store.save(
@@ -333,7 +433,7 @@ def crawl(
                         (run, row_site, row["url"]),
                     ).fetchone():
                         kind = "xml"
-                    store.save(
+                    received = store.save(
                         run,
                         row_site,
                         url,
@@ -346,6 +446,11 @@ def crawl(
                         encoding=encoding,
                         mentions=[],
                     )
+                    store.db.execute(
+                        "UPDATE static_requests SET resource_id=? WHERE id=?",
+                        (received, request_id),
+                    )
+                    store.db.commit()
                     progress(store, run, "response_parse", url)
                     process(
                         store,
@@ -366,7 +471,7 @@ def crawl(
                     error = decode_warning or (
                         f"HTTP {response.status_code}" if response.status_code >= 400 else None
                     )
-                    if response.is_redirect and (
+                    if is_redirect and (
                         not location
                         or not clean_url(url, location)
                         or not authorized(
@@ -383,12 +488,42 @@ def crawl(
                         "UPDATE queue SET state=?,error=? WHERE run_id=? AND site=? AND url=?",
                         (state, error, run, row_site, row["url"]),
                     )
-            except (httpx.HTTPError, ValueError, LookupError, OSError, EOFError) as error:
+            except (RequestException, ValueError, LookupError, OSError, EOFError) as error:
                 store.db.rollback()
                 store.db.execute(
                     "UPDATE queue SET state='failed',error=? WHERE run_id=? AND site=? AND url=?",
                     (str(error), run, row_site, row["url"]),
                 )
+                if request_id is not None:
+                    store.db.execute(
+                        "UPDATE static_requests SET error=? WHERE id=?", (str(error), request_id)
+                    )
+            if (
+                request_id is not None
+                and store.db.execute(
+                    "SELECT status FROM static_requests WHERE id=?", (request_id,)
+                ).fetchone()[0]
+                == 403
+            ):
+                following = next_fingerprint(store, run, site, url, fingerprints)
+                store.db.execute(
+                    "UPDATE queue SET state=?,error=? WHERE run_id=? AND site=? AND url=?",
+                    (
+                        "pending" if following else "failed",
+                        f"HTTP 403: {fingerprint}; "
+                        + ("retry queued" if following else "all fingerprints exhausted"),
+                        run,
+                        row_site,
+                        row["url"],
+                    ),
+                )
+                if following and following != fingerprint:
+                    progress(
+                        store,
+                        run,
+                        "fingerprint_rotated",
+                        json.dumps({"url": url, "from": fingerprint, "to": following}),
+                    )
             store.db.commit()
 
 
@@ -424,6 +559,19 @@ def import_katana(
                         ),
                         "",
                     )
+                    if non_text_response(url, mime, text.encode("utf-8")[:16]):
+                        store.save(
+                            run,
+                            site,
+                            url + "#observed-url",
+                            url.encode(),
+                            url,
+                            "katana_url",
+                            collector="katana_url",
+                        )
+                        enqueue(store, run, site, url, 0, False, "skipped_type")
+                        progress(store, run, "import_record", str(number))
+                        continue
                     process(
                         store,
                         run,

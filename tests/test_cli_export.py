@@ -6,23 +6,58 @@ import httpx
 from blacklink_discovery.cli import main
 
 
-def test_collection_persists_without_export_until_requested(tmp_path, monkeypatch):
+def test_restart_safe_scan_reuses_batch_and_rejects_changed_scope(
+    tmp_path, monkeypatch, mock_static_http
+):
+    import pytest
+
+    sites = tmp_path / "sites.txt"
+    sites.write_text("https://site.example/\n")
+    output = tmp_path / "out"
+    mock_static_http(lambda request: httpx.Response(200, text="<urlset/>"))
+
+    def invoke(*extra):
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "blacklink-discovery",
+                "--output",
+                str(output),
+                "scan",
+                "--sites",
+                str(sites),
+                "--resume-latest",
+                "--delay",
+                "0",
+                *extra,
+            ],
+        )
+        main()
+
+    invoke("--max-urls", "1")
+    invoke()
+    with sqlite3.connect(output / "discovery.sqlite") as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert not db.execute("SELECT 1 FROM queue WHERE state='pending'").fetchone()
+    sites.write_text("https://other.example/\n")
+    with pytest.raises(SystemExit):
+        invoke()
+    with sqlite3.connect(output / "discovery.sqlite") as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_collection_persists_without_export_until_requested(
+    tmp_path, monkeypatch, mock_static_http
+):
     output = tmp_path / "output"
     sites = tmp_path / "sites.txt"
     sites.write_text("https://site.example/\n")
-    client = httpx.Client
-    monkeypatch.setattr(
-        "blacklink_discovery.collect.httpx.Client",
-        lambda **kwargs: client(
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(
-                    200,
-                    text="<urlset/>" if request.url.path.endswith(".xml") else "legacy.example.net",
-                    headers={"content-type": "text/plain"},
-                )
-            ),
-            **kwargs,
-        ),
+    mock_static_http(
+        lambda request: httpx.Response(
+            200,
+            text="<urlset/>" if request.url.path.endswith(".xml") else "legacy.example.net",
+            headers={"content-type": "text/plain"},
+        )
     )
 
     def cli(*args):

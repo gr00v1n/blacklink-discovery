@@ -60,7 +60,7 @@ def domains(
 ) -> dict:
     require_run(store, run)
     where, values = filters(run, site, domain, source)
-    where += " AND f.host_type!='file_candidate'"
+    where += " AND f.host_type IN ('dns','ip','single_label')"
     grouped = (
         "SELECT r.site,f.host AS domain,f.registered,f.host_type,COUNT(*) AS occurrences,"
         "COUNT(DISTINCT r.id) AS resources FROM findings f JOIN resources r ON r.id=f.resource_id "

@@ -1,8 +1,93 @@
 """One URL and host authorization boundary for all collectors."""
 
-from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote, urldefrag, urljoin, urlsplit, urlunsplit
 
 import idna
+
+NON_TEXT_EXTENSIONS = {
+    "pdf",
+    "zip",
+    "rar",
+    "7z",
+    "tar",
+    "tgz",
+    "bz2",
+    "xz",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "ico",
+    "bmp",
+    "avif",
+    "svg",
+    "woff",
+    "woff2",
+    "ttf",
+    "otf",
+    "eot",
+    "mp3",
+    "mp4",
+    "wav",
+    "avi",
+    "webm",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
+    "exe",
+    "dmg",
+    "iso",
+    "wasm",
+}
+
+
+def non_text_url(url: str) -> bool:
+    path = unquote(urlsplit(url).path).lower()
+    return path.rsplit(".", 1)[-1] in NON_TEXT_EXTENSIONS
+
+
+def non_text_response(url: str, mime: str, prefix: bytes = b"") -> bool:
+    mime = mime.lower().split(";", 1)[0].strip()
+    return (
+        non_text_url(url)
+        or mime.startswith(
+            (
+                "image/",
+                "audio/",
+                "video/",
+                "font/",
+                "application/vnd.openxmlformats-officedocument.",
+            )
+        )
+        or mime
+        in {
+            "application/pdf",
+            "application/zip",
+            "application/x-zip-compressed",
+            "application/x-rar-compressed",
+            "application/x-7z-compressed",
+            "application/wasm",
+            "application/msword",
+            "application/vnd.ms-excel",
+            "application/vnd.ms-powerpoint",
+        }
+        or prefix.startswith(
+            (
+                b"%PDF-",
+                b"PK\x03\x04",
+                b"\x89PNG\r\n",
+                b"GIF8",
+                b"\xff\xd8\xff",
+                b"wOFF",
+                b"wOF2",
+                b"\x00asm",
+            )
+        )
+    )
 
 
 def canonical_url(value: str, base: str | None = None) -> str:

@@ -6,9 +6,11 @@ import json
 from importlib.metadata import version
 from urllib.parse import urlsplit
 
-from .collect import crawl
+from .collect import crawl, process, record_expansion
+from .extract import Mention
+from .static_http import DEFAULT_FINGERPRINTS, validate_fingerprints
 from .store import Store
-from .urls import canonical_url, normalize_hosts
+from .urls import authorized, canonical_url, normalize_hosts
 
 
 def require_run(store: Store, run: int):
@@ -28,6 +30,8 @@ def event(store: Store, run: int, name: str, detail: str = ""):
 def save_config(store: Store, run: int, config: dict):
     require_run(store, run)
     config = dict(config, tool_version=version("blacklink-discovery"))
+    config.setdefault("user_agent", None)
+    config["fingerprints"] = validate_fingerprints(config.get("fingerprints", DEFAULT_FINGERPRINTS))
     store.db.execute("INSERT INTO run_configs VALUES(?,?)", (run, json.dumps(config)))
     store.db.commit()
 
@@ -77,6 +81,12 @@ def status(store: Store, run: int) -> dict:
         if "browser_fallbacks" in tables
         else []
     )
+    config = json.loads(config_row[0]) if config_row else None
+    browser_pending = (
+        len(browser_candidates(store, run, config))
+        if config and (config.get("browser_crawl") or config.get("browser_fallback"))
+        else 0
+    )
     return {
         "run": dict(row),
         "config": json.loads(config_row[0]) if config_row else None,
@@ -89,14 +99,28 @@ def status(store: Store, run: int) -> dict:
             (run,),
         ).fetchone()[0],
         "domains": store.db.execute(
-            "SELECT COUNT(DISTINCT f.host) FROM findings f JOIN resources r ON r.id=f.resource_id WHERE r.run_id=?",
+            "SELECT COUNT(DISTINCT f.host) FROM findings f JOIN resources r ON r.id=f.resource_id WHERE r.run_id=? AND f.host_type IN ('dns','ip','single_label')",
             (run,),
         ).fetchone()[0],
         "last_event": dict(latest) if latest else None,
         "request_observations": observations,
         "browser_fallbacks": fallback,
+        "browser_pending": browser_pending,
+        "static_requests": [
+            dict(item)
+            for item in store.db.execute(
+                "SELECT fingerprint,status,COUNT(*) AS count FROM static_requests WHERE run_id=? GROUP BY fingerprint,status",
+                (run,),
+            )
+        ]
+        if "static_requests" in tables
+        else [],
         "queue_exhausted": counts.get("pending", 0) == 0,
-        "coverage_clear": bool(counts) and all(state == "done" for state in counts),
+        "workflow_exhausted": counts.get("pending", 0) == 0 and browser_pending == 0,
+        "coverage_clear": bool(counts)
+        and all(state in {"done", "skipped_type"} for state in counts)
+        and all(item["state"] == "captured" for item in fallback)
+        and browser_pending == 0,
         "note": "Queue exhaustion is not a claim of whole-site completeness; process liveness must be checked separately.",
     }
 
@@ -151,64 +175,163 @@ def retry(store: Store, run: int, max_attempts: int, urls: list[str]) -> dict:
     return {"run_id": run, "queued": len(selected), "network_started": False}
 
 
+def merge_browser(store: Store, run: int, browser_run: int, site: str, depth: int, config: dict):
+    # Import successful response and DOM evidence into the original site's queue.
+    # Failed challenge documents are retained in their browser batch, never expanded.
+    rows = store.db.execute(
+        "SELECT r.*,t.path AS text_path FROM resources r JOIN text_views t ON t.resource_id=r.id "
+        "WHERE r.run_id=? AND r.collector='browser_dom' AND r.status>=200 AND r.status<300",
+        (browser_run,),
+    ).fetchall()
+    for row in rows:
+        if not authorized(
+            row["url"], site, row["kind"] != "html", normalize_hosts(config["asset_hosts"])
+        ):
+            continue
+        mentions = [
+            Mention(*item)
+            for item in store.db.execute(
+                "SELECT host,registered,host_type,start,end,line,col,source,method,evidence FROM findings WHERE resource_id=?",
+                (row["id"],),
+            )
+        ]
+        resource = process(
+            store,
+            run,
+            site,
+            row["url"],
+            (store.directory / row["evidence_path"]).read_bytes(),
+            (store.directory / row["text_path"]).read_bytes().decode("utf-8"),
+            row["kind"],
+            depth + browser_depth(store, browser_run, row["url"]),
+            config["depth"],
+            normalize_hosts(config["asset_hosts"]),
+            row["status"],
+            collector="browser_supplement",
+            encoding=row["encoding"],
+            mentions=mentions,
+            parent_resource_id=0,
+        )
+        store.edge(
+            run, site, row["url"], row["url"], "browser_supplement", parent_resource_id=row["id"]
+        )
+        event(
+            store,
+            run,
+            "browser_merged",
+            json.dumps(
+                {
+                    "browser_run_id": browser_run,
+                    "resource_id": resource,
+                    "source_resource_id": row["id"],
+                }
+            ),
+        )
+
+
+def browser_depth(store: Store, run: int, url: str) -> int:
+    row = store.db.execute(
+        "SELECT depth FROM browser_depths WHERE run_id=? AND url=?", (run, canonical_url(url))
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def replay_expansions(store: Store, run: int, config: dict):
+    # A shorter discovered path changes expansion eligibility, not the HTTP request outcome.
+    while True:
+        rows = store.db.execute(
+            "WITH candidates AS (SELECT r.*,t.path AS text_path, "
+            "MIN(COALESCE(q.depth,2147483647), "
+            "COALESCE(origin.depth+COALESCE(bd.depth,0),2147483647)) AS depth, "
+            "e.depth AS expanded_depth FROM resources r "
+            "JOIN text_views t ON t.resource_id=r.id "
+            "LEFT JOIN queue q ON q.run_id=r.run_id AND q.site=r.site "
+            "AND (r.url=q.url OR r.url=q.url||'#dom') "
+            "LEFT JOIN resources source ON source.id=r.parent_resource_id "
+            "LEFT JOIN browser_fallbacks b ON b.run_id=r.run_id AND b.site=r.site "
+            "AND b.browser_run_id=source.run_id "
+            "LEFT JOIN queue origin ON origin.run_id=b.run_id AND origin.site=b.site AND origin.url=b.url "
+            "LEFT JOIN browser_depths bd ON bd.run_id=source.run_id "
+            "AND (source.url=bd.url OR source.url=bd.url||'#dom') "
+            "LEFT JOIN expansions e ON e.resource_id=r.id "
+            "WHERE r.run_id=? AND r.status>=200 AND r.status<300 "
+            "AND r.collector IN ('static','browser_supplement') "
+            "AND (q.url IS NOT NULL OR origin.url IS NOT NULL)) "
+            "SELECT * FROM candidates WHERE expanded_depth IS NULL OR depth<expanded_depth ORDER BY depth,id",
+            (run,),
+        ).fetchall()
+        if not rows:
+            return
+        for row in rows:
+            try:
+                resource = process(
+                    store,
+                    run,
+                    row["site"],
+                    row["url"],
+                    (store.directory / row["evidence_path"]).read_bytes(),
+                    (store.directory / row["text_path"]).read_bytes().decode("utf-8"),
+                    row["kind"],
+                    row["depth"],
+                    config["depth"],
+                    normalize_hosts(config["asset_hosts"]),
+                    row["status"],
+                    collector=row["collector"],
+                    encoding=row["encoding"],
+                    parent_resource_id=row["parent_resource_id"],
+                    mentions=[
+                        Mention(*item)
+                        for item in store.db.execute(
+                            "SELECT host,registered,host_type,start,end,line,col,source,method,evidence FROM findings WHERE resource_id=?",
+                            (row["id"],),
+                        )
+                    ],
+                )
+                if resource is None:
+                    # Old batches may contain binary records; do not replay them forever.
+                    record_expansion(store, row["id"], row["depth"])
+            except ValueError as error:
+                event(
+                    store,
+                    run,
+                    "expansion_failed",
+                    json.dumps({"resource_id": row["id"], "error": str(error)}),
+                )
+
+
 def resume(store: Store, run: int, max_urls: int = 0):
     config = load_config(store, run)
     event(store, run, "started", "resume with saved authorization and configuration")
     try:
-        crawl(
-            store,
-            run,
-            config["sites"],
-            config["depth"],
-            config["delay"],
-            normalize_hosts(config["asset_hosts"]),
-            config["max_bytes"],
-            max_urls,
-        )
-        if config.get("browser_fallback"):
-            from .browser import collect_browser
-
-            approved = {canonical_url(site) for site in config["sites"]}
-            rows = store.db.execute(
-                "SELECT DISTINCT r.site,r.url FROM resources r JOIN queue q ON q.run_id=r.run_id AND q.site=r.site AND q.url=r.url WHERE r.run_id=? AND r.status=403 AND r.kind='html' AND q.state='failed' AND q.asset=0 AND NOT EXISTS(SELECT 1 FROM browser_fallbacks b WHERE b.run_id=r.run_id AND b.site=r.site AND b.url=r.url)",
-                (run,),
-            ).fetchall()
-            for row in rows:
-                path = urlsplit(row["url"]).path.lower()
-                if (
-                    canonical_url(row["site"]) not in approved
-                    or path.endswith(("robots.txt", ".xml", ".xml.gz"))
-                    or "sitemap" in path
-                ):
-                    continue
-                store.db.execute(
-                    "INSERT INTO browser_fallbacks(run_id,site,url,state) VALUES(?,?,?,'started')",
-                    (run, row["site"], row["url"]),
-                )
-                store.db.commit()
-                event(store, run, "fallback_started", row["url"])
-                supplemental = asyncio.run(
-                    collect_browser(
-                        store,
-                        row["url"],
-                        None,
-                        config.get("browser_chrome"),
-                        3,
-                        normalize_hosts(config["asset_hosts"]),
-                    )
-                )
-                result = status(store, supplemental)
-                state = "captured" if result["coverage_clear"] else "partial"
-                store.db.execute(
-                    "UPDATE browser_fallbacks SET browser_run_id=?,state=? WHERE run_id=? AND site=? AND url=?",
-                    (supplemental, state, run, row["site"], row["url"]),
-                )
-                event(
-                    store,
-                    run,
-                    "fallback_" + state,
-                    json.dumps({"url": row["url"], "browser_run_id": supplemental}),
-                )
+        used = 0
+        while True:
+            replay_expansions(store, run, config)
+            before = store.db.execute(
+                "SELECT COALESCE(SUM(count),0) FROM attempts WHERE run_id=?", (run,)
+            ).fetchone()[0]
+            crawl(
+                store,
+                run,
+                config["sites"],
+                config["depth"],
+                config["delay"],
+                normalize_hosts(config["asset_hosts"]),
+                config["max_bytes"],
+                max_urls - used if max_urls else 0,
+                config.get("user_agent"),
+                config.get("fingerprints", DEFAULT_FINGERPRINTS),
+            )
+            after = store.db.execute(
+                "SELECT COALESCE(SUM(count),0) FROM attempts WHERE run_id=?", (run,)
+            ).fetchone()[0]
+            used += after - before
+            if config.get("browser_fallback") or config.get("browser_crawl"):
+                browser_wave(store, run, config)
+            replay_expansions(store, run, config)
+            if max_urls and used >= max_urls:
+                break
+            if status(store, run)["queue_exhausted"]:
+                break
     except KeyboardInterrupt:
         store.db.rollback()
         event(store, run, "interrupted", "pending queue retained")
@@ -223,6 +346,69 @@ def resume(store: Store, run: int, max_urls: int = 0):
         "queue_exhausted" if status(store, run)["queue_exhausted"] else "paused",
         "check coverage before declaring completion",
     )
+
+
+def browser_candidates(store: Store, run: int, config: dict):
+    approved = {canonical_url(site) for site in config["sites"]}
+    rows = store.db.execute(
+        "SELECT DISTINCT r.site,r.url,q.depth FROM resources r JOIN queue q ON q.run_id=r.run_id AND q.site=r.site AND q.url=r.url WHERE r.run_id=? AND ((r.status=403 AND q.state='failed') OR (? AND r.status>=200 AND r.status<300)) AND r.kind='html' AND q.state IN ('failed','done') AND q.asset=0 AND NOT EXISTS(SELECT 1 FROM browser_fallbacks b WHERE b.run_id=r.run_id AND b.site=r.site AND b.url=r.url AND b.state!='started') ORDER BY q.depth,r.site,r.url",
+        (run, bool(config.get("browser_crawl"))),
+    ).fetchall()
+    selected = []
+    for row in rows:
+        path = urlsplit(row["url"]).path.lower()
+        if (
+            canonical_url(row["site"]) not in approved
+            or path.endswith(("robots.txt", ".xml", ".xml.gz"))
+            or "sitemap" in path
+        ):
+            continue
+        selected.append(row)
+    return selected
+
+
+def browser_wave(store: Store, run: int, config: dict):
+    from .browser import collect_browser
+
+    for row in browser_candidates(store, run, config):
+        store.db.execute(
+            "INSERT OR IGNORE INTO browser_fallbacks(run_id,site,url,state) VALUES(?,?,?,'started')",
+            (run, row["site"], row["url"]),
+        )
+        event(store, run, "fallback_started", row["url"])
+        previous = store.db.execute(
+            "SELECT browser_run_id FROM browser_fallbacks WHERE run_id=? AND site=? AND url=?",
+            (run, row["site"], row["url"]),
+        ).fetchone()[0]
+        supplemental = previous or asyncio.run(
+            collect_browser(
+                store,
+                row["url"],
+                None,
+                config.get("browser_chrome"),
+                3,
+                normalize_hosts(config["asset_hosts"]),
+                parent_run=run,
+                parent_site=row["site"],
+            )
+        )
+        result = status(store, supplemental)
+        current_depth = store.db.execute(
+            "SELECT depth FROM queue WHERE run_id=? AND site=? AND url=?",
+            (run, row["site"], row["url"]),
+        ).fetchone()[0]
+        merge_browser(store, run, supplemental, row["site"], current_depth, config)
+        state = "captured" if result["coverage_clear"] else "partial"
+        store.db.execute(
+            "UPDATE browser_fallbacks SET browser_run_id=?,state=? WHERE run_id=? AND site=? AND url=?",
+            (supplemental, state, run, row["site"], row["url"]),
+        )
+        event(
+            store,
+            run,
+            "fallback_" + state,
+            json.dumps({"url": row["url"], "browser_run_id": supplemental}),
+        )
 
 
 def verify(store: Store, run: int) -> dict:

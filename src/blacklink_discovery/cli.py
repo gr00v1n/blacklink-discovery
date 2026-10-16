@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .collect import import_katana
 from .results import domains, evidence, findings
+from .static_http import DEFAULT_FINGERPRINTS, validate_fingerprints
 from .store import Store
 from .supervise import failures, load_config, resume, retry, save_config, status, verify
 from .urls import canonical_url, normalize_hosts
@@ -18,6 +19,10 @@ def main():
     scan.add_argument("--sites", required=True)
     scan.add_argument("--depth", type=int, default=6)
     scan.add_argument("--delay", type=float, default=0.5)
+    scan.add_argument("--user-agent", help="可选覆盖UA；默认使用指纹配套UA，随批次保存")
+    scan.add_argument(
+        "--fingerprint", action="append", help="curl_cffi指纹，按传入顺序轮换；可重复指定不同指纹"
+    )
     scan.add_argument(
         "--asset-host", action="append", default=[], help="允许获取关联资源的外部主机；可重复"
     )
@@ -25,10 +30,21 @@ def main():
     scan.add_argument(
         "--max-urls", type=int, default=0, help="0表示不设数量上限；停止后pending保留"
     )
-    scan.add_argument("--resume", type=int)
+    recovery = scan.add_mutually_exclusive_group()
+    recovery.add_argument("--resume", type=int)
+    recovery.add_argument(
+        "--resume-latest",
+        action="store_true",
+        help="复用最新静态批次，首次运行才创建；配置不一致则拒绝，适合服务重启",
+    )
     scan.add_argument("--retry-failed", action="store_true")
     scan.add_argument(
         "--browser-fallback", action="store_true", help="静态页面403后单次只读浏览器补采；单独批次"
+    )
+    scan.add_argument(
+        "--browser-crawl",
+        action="store_true",
+        help="成功页面及403页面动态补采，站内新链接自动回流队列",
     )
     scan.add_argument("--browser-chrome", help="403补采使用的Chromium路径")
     imported = commands.add_parser("import-katana")
@@ -128,7 +144,14 @@ def main():
                 parser.error("site list is empty")
             if args.depth < 0 or args.delay < 0 or args.max_bytes < 1 or args.max_urls < 0:
                 parser.error("depth/delay/max-urls must be nonnegative; max-bytes must be positive")
-            run = args.resume or store.new_run("anonymous-static")
+            latest = (
+                store.db.execute(
+                    "SELECT id FROM runs WHERE label='anonymous-static' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if args.resume_latest
+                else None
+            )
+            run = args.resume or (latest[0] if latest else store.new_run("anonymous-static"))
             if not store.db.execute("SELECT 1 FROM runs WHERE id=?", (run,)).fetchone():
                 parser.error("resume run does not exist")
             config = {
@@ -137,7 +160,10 @@ def main():
                 "delay": args.delay,
                 "asset_hosts": sorted(normalize_hosts(args.asset_host)),
                 "max_bytes": args.max_bytes,
+                "user_agent": args.user_agent,
+                "fingerprints": validate_fingerprints(args.fingerprint or DEFAULT_FINGERPRINTS),
                 "browser_fallback": args.browser_fallback,
+                "browser_crawl": args.browser_crawl,
                 "browser_chrome": args.browser_chrome,
             }
             if not store.db.execute("SELECT 1 FROM run_configs WHERE run_id=?", (run,)).fetchone():
@@ -149,7 +175,8 @@ def main():
             else:
                 saved = load_config(store, run)
                 if any(
-                    saved.get(key, False if key == "browser_fallback" else None) != value
+                    saved.get(key, False if key in {"browser_fallback", "browser_crawl"} else None)
+                    != value
                     for key, value in config.items()
                 ):
                     parser.error(

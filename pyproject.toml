@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Evidence-first domain discovery for blacklink investigations; no risk classification"
 requires-python = ">=3.11"
 dependencies = [
+  "curl-cffi==0.16.3",
   "httpx>=0.28,<1",
   "idna>=3.10,<4",
   "openpyxl>=3.1,<4",

@@ -23,6 +23,271 @@ def chrome_path():
     pytest.skip("install optional Playwright Chromium or set TEST_CHROME for browser E2E")
 
 
+def test_browser_records_binary_urls_without_downloading_or_parsing_files(tmp_path):
+    pytest.importorskip("playwright")
+    chrome = chrome_path()
+    requested = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested.append(self.path)
+            body = b"""<img src="/photo.png"><iframe src="/report.pdf"></iframe>
+                <script>fetch('/download');fetch('/mislabelled');</script>"""
+            mime = "text/html"
+            if self.path in {"/download", "/mislabelled"}:
+                body = b"%PDF-1.6 binary-only.example.net"
+                mime = "application/pdf" if self.path == "/download" else "text/plain"
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    site = f"http://127.0.0.1:{server.server_port}/"
+    store = Store(str(tmp_path))
+    try:
+        run = asyncio.run(collect_browser(store, site, None, chrome, 1, set()))
+        assert "/photo.png" not in requested and "/report.pdf" not in requested
+        assert "/download" in requested and "/mislabelled" in requested
+        assert (
+            store.db.execute(
+                "SELECT COUNT(*) FROM request_observations WHERE run_id=? AND state='not_text'",
+                (run,),
+            ).fetchone()[0]
+            >= 4
+        )
+        assert store.db.execute(
+            "SELECT 1 FROM resources WHERE run_id=? AND collector='browser_url' AND url LIKE '%/report.pdf#observed-url'",
+            (run,),
+        ).fetchone()
+        assert not store.db.execute(
+            "SELECT 1 FROM findings WHERE host='binary-only.example.net'"
+        ).fetchone()
+        assert verify(store, run)["integrity_ok"]
+    finally:
+        store.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_combined_scan_follows_dynamic_links_without_manual_seeds(tmp_path):
+    pytest.importorskip("playwright")
+    from blacklink_discovery.supervise import resume, save_config
+
+    chrome = chrome_path()
+    requested = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested.append(self.path)
+            browser = "Chrome" in self.headers.get("User-Agent", "")
+            body = {
+                "/": b"<script>document.write('<a href=\"/child\">next</a>')</script>",
+                "/child": b"<!-- legacy.example.net --><script>document.write('<a href=\"/grandchild\">next</a>')</script>",
+                "/grandchild": b'<a href="/">loop</a><a href="/too-deep">depth</a><a href="http://localhost:1/outside">external</a>',
+            }.get(self.path, b"not found")
+            self.send_response(
+                200 if browser and self.path in {"/", "/child", "/grandchild"} else 403
+            )
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body if browser else b"denied")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    site = f"http://127.0.0.1:{server.server_port}/"
+    store = Store(str(tmp_path))
+    try:
+        run = store.new_run("combined-test")
+        save_config(
+            store,
+            run,
+            {
+                "sites": [site],
+                "depth": 2,
+                "delay": 0,
+                "asset_hosts": [],
+                "max_bytes": 100000,
+                "browser_crawl": True,
+                "browser_chrome": chrome,
+            },
+        )
+        resume(store, run, max_urls=3)
+        assert not status(store, run)["queue_exhausted"]
+        resume(store, run)
+        assert "/child" in requested and "/grandchild" in requested
+        assert "/too-deep" not in requested
+        assert status(store, run)["queue_exhausted"]
+        assert store.db.execute(
+            "SELECT COUNT(*) FROM findings f JOIN resources r ON r.id=f.resource_id WHERE r.run_id=? AND f.host='legacy.example.net' AND f.source='HTML_COMMENT'",
+            (run,),
+        ).fetchone()[0]
+        assert store.db.execute(
+            "SELECT COUNT(*) FROM queue WHERE run_id=? AND state='skipped_scope'", (run,)
+        ).fetchone()[0]
+        assert verify(store, run)["integrity_ok"]
+        before = len(requested)
+        resume(store, run)
+        assert len(requested) == before
+        assert not list(tmp_path.glob("*.csv")) and not list(tmp_path.glob("*.xlsx"))
+    finally:
+        store.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("shortcut", ["same_wave", "later_wave", "navigated_later_wave"])
+def test_combined_scan_reexpands_shorter_paths_and_preserves_crlf(tmp_path, shortcut):
+    pytest.importorskip("playwright")
+    from blacklink_discovery.supervise import resume, save_config
+
+    chrome = chrome_path()
+    requested = []
+    target = "/x" if shortcut == "same_wave" else "/late"
+    pages = {
+        "/": '<a href="/a">long</a><iframe src="/frame"></iframe><script src="/app.js"></script>',
+        "/a": '<a href="/b">next</a>',
+        "/b": '<a href="/x">next</a>',
+        "/x": '<a href="/y">previously too deep</a>',
+        "/y": "<!-- reached.example.net -->",
+        "/late": "<script>document.write('<a href=\"/x\">shortcut</a>')</script>",
+        "/frame": '<iframe src="/frame2"></iframe>',
+        "/frame2": '<iframe src="/frame3"></iframe>',
+        "/frame3": '<a href="/frame-deep">too deep</a>',
+        "/app.js": "\r\n// legacy.example.net\r\ndocument.write('<a href=\""
+        + target
+        + "\">shortcut</a>');",
+    }
+    if shortcut == "navigated_later_wave":
+        pages["/x"] = "<script>location.href='/landing'</script>"
+        pages["/landing"] = '<a href="/y">previously too deep</a>'
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested.append(self.path)
+            self.send_response(200 if self.path in pages else 404)
+            self.send_header(
+                "Content-Type", "text/javascript" if self.path == "/app.js" else "text/html"
+            )
+            self.end_headers()
+            self.wfile.write(pages.get(self.path, "missing").encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    site = f"http://127.0.0.1:{server.server_port}/"
+    store = Store(str(tmp_path))
+    try:
+        run = store.new_run("short-path")
+        save_config(
+            store,
+            run,
+            {
+                "sites": [site],
+                "depth": 3,
+                "delay": 0,
+                "asset_hosts": [],
+                "max_bytes": 100000,
+                "browser_crawl": True,
+                "browser_chrome": chrome,
+            },
+        )
+        resume(store, run)
+        assert "/y" in requested
+        assert "/frame-deep" not in requested
+        assert requested.count("/x") == 2  # One static request and one browser visit.
+        assert verify(store, run)["integrity_ok"]
+        assert status(store, run)["workflow_exhausted"]
+        imported = store.db.execute(
+            "SELECT r.evidence_path,t.path FROM resources r JOIN text_views t ON t.resource_id=r.id WHERE r.run_id=? AND r.url=? AND r.collector='browser_response'",
+            (run, site + "app.js"),
+        ).fetchone()
+        assert imported
+        assert (tmp_path / imported[0]).read_bytes() == (tmp_path / imported[1]).read_bytes()
+        assert b"\r\n" in (tmp_path / imported[1]).read_bytes()
+        assert not list(tmp_path.glob("*.csv"))
+    finally:
+        store.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize(
+    "first_status,final_status", [(200, 403), (403, 200), (200, "pushState"), (200, "replaceState")]
+)
+def test_browser_dom_tracks_final_document_status(tmp_path, first_status, final_status):
+    pytest.importorskip("playwright")
+    from blacklink_discovery.supervise import merge_browser
+
+    chrome = chrome_path()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            initial = self.path == "/"
+            if isinstance(final_status, str):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    (
+                        "<script>history."
+                        + final_status
+                        + "({},'', '/route');document.write('<a href=\"/only-final\">link</a>')</script>"
+                    ).encode()
+                )
+                return
+            self.send_response(first_status if initial else final_status)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"<script>setTimeout(()=>location.href='/final',100)</script>"
+                if initial
+                else b'<a href="/only-final">link</a>'
+            )
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    site = f"http://127.0.0.1:{server.server_port}/"
+    store = Store(str(tmp_path))
+    try:
+        child = asyncio.run(collect_browser(store, site, None, chrome, 0.5, set()))
+        assert store.db.execute(
+            "SELECT status FROM resources WHERE run_id=? AND collector='browser_dom'", (child,)
+        ).fetchone()[0] == (200 if isinstance(final_status, str) else final_status)
+        parent = store.new_run("merge")
+        merge_browser(store, parent, child, site, 0, {"depth": 2, "asset_hosts": []})
+        found = store.db.execute(
+            "SELECT COUNT(*) FROM queue WHERE run_id=? AND url=?", (parent, site + "only-final")
+        ).fetchone()[0]
+        assert bool(found) == (final_status == 200 or isinstance(final_status, str))
+        assert verify(store, parent)["integrity_ok"]
+    finally:
+        store.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_browser_read_only_capture_redirects_failures_and_limits(tmp_path):
     pytest.importorskip("playwright")
     chrome = chrome_path()
@@ -138,6 +403,27 @@ def test_browser_read_only_capture_redirects_failures_and_limits(tmp_path):
         thread.join()
 
 
+def test_browser_connection_failure_closes_without_transport_race(tmp_path):
+    pytest.importorskip("playwright")
+    chrome = chrome_path()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    port = server.server_port
+    server.server_close()
+    store = Store(str(tmp_path))
+    try:
+        run = asyncio.run(
+            collect_browser(store, f"http://127.0.0.1:{port}/", None, chrome, 0, set())
+        )
+        report = status(store, run)
+        assert not report["coverage_clear"]
+        assert "request failed" in report["last_event"]["detail"]
+        assert "cleanup failed" not in report["last_event"]["detail"]
+        assert "cleanup deadline" not in report["last_event"]["detail"]
+        assert verify(store, run)["integrity_ok"]
+    finally:
+        store.close()
+
+
 def test_browser_success_and_parser_failure_preserves_received_source(tmp_path, monkeypatch):
     pytest.importorskip("playwright")
     chrome = chrome_path()
@@ -235,6 +521,84 @@ def test_browser_success_and_parser_failure_preserves_received_source(tmp_path, 
             (failed,),
         ).fetchone()[0]
         assert verify(store, failed)["integrity_ok"]
+    finally:
+        store.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_shared_script_is_parsed_once_across_parent_page_batches(tmp_path):
+    pytest.importorskip("playwright")
+    chrome = chrome_path()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/app.js":
+                body = b"const host='shared.example.net';"
+                mime = "text/javascript"
+            else:
+                body = f'<script src="/app.js"></script><a href="{self.path}next">next</a>'.encode()
+                mime = "text/html"
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    site = f"http://127.0.0.1:{server.server_port}/"
+    store = Store(str(tmp_path))
+    try:
+        parent = store.new_run("parent")
+        store.db.execute(
+            "INSERT INTO browser_fallbacks(run_id,site,url,state) VALUES(?,?,?,'started')",
+            (parent, site, site),
+        )
+        store.db.execute(
+            "INSERT INTO browser_fallbacks(run_id,site,url,state) VALUES(?,?,?,'started')",
+            (parent, site, site + "next"),
+        )
+        store.db.commit()
+        first = asyncio.run(
+            collect_browser(
+                store, site, None, chrome, 0, set(), parent_run=parent, parent_site=site
+            )
+        )
+        second = asyncio.run(
+            collect_browser(
+                store, site + "next", None, chrome, 0, set(), parent_run=parent, parent_site=site
+            )
+        )
+        assert first != second
+        parsed = store.db.execute(
+            "SELECT COUNT(*) FROM resources WHERE run_id=? AND url=? AND collector='browser_response'",
+            (parent, site + "app.js"),
+        ).fetchone()[0]
+        mentions = store.db.execute(
+            "SELECT COUNT(*) FROM findings f JOIN resources r ON r.id=f.resource_id "
+            "WHERE r.run_id=? AND r.url=? AND f.host='shared.example.net'",
+            (parent, site + "app.js"),
+        ).fetchone()[0]
+        positions = store.db.execute(
+            "SELECT COUNT(*) FROM edges WHERE run_id=? AND child=? AND relation='browser_response'",
+            (parent, site + "app.js"),
+        ).fetchone()[0]
+        assert positions == 2
+        assert parsed == 1
+        assert mentions == 1
+        sites = {
+            row[0]
+            for row in store.db.execute(
+                "SELECT DISTINCT site FROM resources WHERE run_id=? AND collector='browser_response'",
+                (parent,),
+            )
+        }
+        assert sites == {site}
     finally:
         store.close()
         server.shutdown()
